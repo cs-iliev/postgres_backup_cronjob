@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgres-restore-job
+spec:
+  template:
+    metadata:
+      name: postgres-restore
+    spec:
+      containers:
+      - name: restore-backup-container
+        image: postgres:latest
+        envFrom:
+        - secretRef:
+            name: postgres-backup-secrets
+        - configMapRef:
+            name: postgres-backup-config
+        command: ["/script/restore_script.sh"]
+        volumeMounts:
+        - name: backup-volume
+          mountPath: /backup
+        - name: script
+          mountPath: "/script"
+
+      initContainers:
+      - name: download-backup-container
+        image: python:3.9-slim
+        envFrom:
+        - secretRef:
+            name: postgres-backup-secrets
+        - configMapRef:
+            name: postgres-backup-config
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            #!/bin/bash
+
+            pip install azure-storage-blob
+            python /script/download_backup.py wiki-db-20231217_081301.sql # Modify before applying
+        volumeMounts:
+        - name: backup-volume
+          mountPath: /backup
+        - name: script
+          mountPath: "/script"
+
+      restartPolicy: OnFailure
+      volumes:
+      - name: script
+        configMap:
+          name: postgres-backup-config
+          defaultMode: 0500
+      - name: backup-volume
+        emptyDir: {}

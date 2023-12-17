@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: list-recent-backups-job
+spec:
+  template:
+    spec:
+      containers:
+      - name: list-recent-backups
+        image: python:3.9-slim
+        envFrom:
+        - secretRef:
+            name: postgres-backup-secrets
+        - configMapRef:
+            name: postgres-backup-config
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            pip install azure-storage-blob
+            python /script/list_recent_backups.py
+        volumeMounts:
+        - name: script
+          mountPath: "/script"
+      restartPolicy: Never
+      volumes:
+      - name: script
+        configMap:
+          name: postgres-backup-config

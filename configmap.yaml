@@ -1,0 +1,163 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-backup-config
+data:
+  POSTGRES_USER: postgres
+  POSTGRES_DB: wiki-db
+  AZURE_STORAGE_ACCOUNT_NAME: devops12041
+  CONTAINER_NAME: backups
+  backup_script.sh: |
+    #!/bin/bash
+
+    POSTGRES_HOST="db-postgresql-service.wiki.svc.cluster.local"
+    TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+    BACKUP_FILE="/backup-volume/$POSTGRES_DB-$TIMESTAMP.sql"
+    pg_dump -U $POSTGRES_USER -d $POSTGRES_DB -h $POSTGRES_HOST > $BACKUP_FILE
+    echo "Dump created successfully"
+
+  restore_script.sh: |
+    #!/bin/bash
+
+    POSTGRES_HOST="db-postgresql-service.wiki.svc.cluster.local"
+    BACKUP_DIR="/backup"
+
+    # Find the most recent backup file
+    BACKUP_FILE=$(ls -t $BACKUP_DIR/wiki-db-*.sql | head -n 1)
+
+    echo "Restoring backup from $BACKUP_FILE..."
+    # Terminate existing connections
+    psql -U $POSTGRES_USER -h $POSTGRES_HOST -c "SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname = '$POSTGRES_DB' AND pid <> pg_backend_pid();"
+    # Drop database
+    psql -U $POSTGRES_USER -h $POSTGRES_HOST -c "DROP DATABASE \"$POSTGRES_DB\""
+    # Create database
+    psql -U $POSTGRES_USER -h $POSTGRES_HOST -c "CREATE DATABASE \"$POSTGRES_DB\""
+    # Restore the backup
+    psql -U $POSTGRES_USER -d $POSTGRES_DB -h $POSTGRES_HOST -f "$BACKUP_FILE"
+
+    if [ $? -eq 0 ]; then
+        echo "Backup restored successfully."
+    else
+        echo "Failed to restore backup."
+    fi
+
+
+  upload_backup_to_blob.py: |
+    import sys
+    import os
+    import base64
+    import binascii
+    from datetime import datetime, timedelta
+    from azure.storage.blob import BlobServiceClient, generate_account_sas, ResourceTypes, AccountSasPermissions
+
+    # Retrieve environment variables
+    storage_account_name = os.getenv('AZURE_STORAGE_ACCOUNT_NAME')
+    storage_account_key = os.getenv('AZURE_STORAGE_ACCOUNT_KEY')
+    container_name = os.getenv('CONTAINER_NAME')
+    backup_dir = "/backup"
+
+    # Find the most recent backup file
+    most_recent_backup = max(
+      (f for f in os.listdir(backup_dir) if f.startswith('wiki-db-') and f.endswith('.sql')), 
+      key=lambda x: os.path.getmtime(os.path.join(backup_dir, x)),
+      default=None
+    )
+
+    # Generate SAS token
+    sas_token = generate_account_sas(
+        account_name=storage_account_name,
+        account_key=storage_account_key,
+        resource_types=ResourceTypes(object=True),
+        permission=AccountSasPermissions(write=True),
+        expiry=datetime.utcnow() + timedelta(hours=1)  # Adjust the expiry time
+    )
+
+    # Use SAS token in BlobServiceClient initialization
+    blob_service_client = BlobServiceClient(account_url=f"https://{storage_account_name}.blob.core.windows.net", credential=sas_token)
+
+    # Get BlobClient for the specified blob
+    blob_client = blob_service_client.get_blob_client(container=container_name, blob=most_recent_backup)
+
+    try:
+      # Upload the backup file
+      with open(os.path.join(backup_dir, most_recent_backup), "rb") as data:
+        blob_client.upload_blob(data, overwrite=True)
+        print(f"Upload successful: {most_recent_backup}")
+    except Exception as e:
+      print(f"Error uploading file: {e}")
+
+    sys.exit()
+        
+  list_recent_backups.py: |
+    import os
+    from azure.storage.blob import BlobServiceClient
+
+    # Retrieve environment variables
+    storage_account_name = os.getenv('AZURE_STORAGE_ACCOUNT_NAME')
+    storage_account_key = os.getenv('AZURE_STORAGE_ACCOUNT_KEY')
+    container_name = os.getenv('CONTAINER_NAME')
+
+    # Initialize BlobServiceClient
+    blob_service_client = BlobServiceClient(account_url=f"https://{storage_account_name}.blob.core.windows.net", credential=storage_account_key)
+
+    # Retrieve the client for the specified container
+    container_client = blob_service_client.get_container_client(container_name)
+
+    # List all blobs, sort by last modified date, and get the top 5
+    blobs_list = container_client.list_blobs()
+    sorted_blobs = sorted(blobs_list, key=lambda x: x.last_modified, reverse=True)[:5]
+
+    for blob in sorted_blobs:
+        print(f"Name: {blob.name}, Last Modified: {blob.last_modified}")
+
+  download_backup.py: |
+    import os
+    import sys
+    from azure.storage.blob import BlobServiceClient
+
+    def download_backup(backup_name, storage_account_name, storage_account_key, container_name, download_dir):
+      try:
+        # Initialize BlobServiceClient
+        blob_service_client = BlobServiceClient(
+          account_url=f"https://{storage_account_name}.blob.core.windows.net", 
+          credential=storage_account_key
+        )
+
+        # Retrieve the client for the specified container
+        container_client = blob_service_client.get_container_client(container_name)
+
+        # Get the blob client for the specified blob
+        blob_client = container_client.get_blob_client(backup_name)
+
+        # Download the blob
+        download_file_path = os.path.join(download_dir, backup_name)
+        print(f"Downloading backup to {download_file_path}...")
+        with open(download_file_path, "wb") as download_file:
+          download_file.write(blob_client.download_blob().readall())
+
+        print("Download completed successfully.")
+      except Exception as e:
+        print(f"Error downloading file: {e}")
+
+    if __name__ == "__main__":
+      if len(sys.argv) != 2:
+        print("Usage: python download_backup.py <backup_name>")
+        sys.exit(1)
+
+      # Retrieve environment variables
+      storage_account_name = os.getenv('AZURE_STORAGE_ACCOUNT_NAME')
+      storage_account_key = os.getenv('AZURE_STORAGE_ACCOUNT_KEY')
+      container_name = os.getenv('CONTAINER_NAME')
+      backup_name = sys.argv[1]
+      download_dir = "/backup"
+
+      # Validate environment variables
+      if not all([storage_account_name, storage_account_key, container_name]):
+        print("Error: Storage account information is missing.")
+        sys.exit(1)
+
+      if not os.path.exists(download_dir):
+        os.makedirs(download_dir)
+
+      download_backup(backup_name, storage_account_name, storage_account_key, container_name, download_dir)
+      print("This is done")

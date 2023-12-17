@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup-cronjob
+spec:
+  schedule: "0 * * * *" # Runs every hour
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          name: postgres-backup
+        spec:
+          containers:
+          - name: upload-backup-container
+            image: python:3.9-slim
+            envFrom:
+            - secretRef:
+                name: postgres-backup-secrets
+            - configMapRef:
+                name: postgres-backup-config
+            command: ["/bin/bash", "-c"]
+            args:
+              - |
+                #!/bin/bash
+
+                pip install azure-storage-blob
+                python /script/upload_backup_to_blob.py
+            volumeMounts:
+            - name: backup-volume
+              mountPath: /backup
+            - name: script
+              mountPath: "/script"
+
+          initContainers:
+          - name: postgres-backup-container
+            image: postgres:latest
+            envFrom:
+            - secretRef:
+                name: postgres-backup-secrets
+            - configMapRef:
+                name: postgres-backup-config
+            command: ["/script/backup_script.sh"]
+            volumeMounts:
+            - name: backup-volume
+              mountPath: /backup-volume
+            - name: script
+              mountPath: "/script"
+
+          restartPolicy: OnFailure
+          volumes:
+          - name: script
+            configMap:
+              name: postgres-backup-config
+              defaultMode: 0500
+          - name: backup-volume
+            emptyDir: {}
